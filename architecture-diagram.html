@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>VM Power Scheduler — System Architecture</title>
+<style>
+  :root {
+    --bg: #0f1419;
+    --panel: #161d26;
+    --panel-border: #2a3441;
+    --accent: #5fb3d9;
+    --accent-dim: #2d4a5c;
+    --aws-color: #ff9900;
+    --azure-color: #5ea0ef;
+    --vmware-color: #84b135;
+    --text: #e6edf3;
+    --text-dim: #8b98a5;
+    --green: #3fb950;
+    --purple: #bc8cff;
+    --mono: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Inter', -apple-system, 'Segoe UI', sans-serif;
+    padding: 32px;
+  }
+
+  .wrap {
+    max-width: 1320px;
+    margin: 0 auto;
+  }
+
+  h1 {
+    font-size: 22px;
+    font-weight: 600;
+    margin: 0 0 4px 0;
+    letter-spacing: -0.01em;
+  }
+
+  .subtitle {
+    color: var(--text-dim);
+    font-size: 13px;
+    margin: 0 0 28px 0;
+  }
+
+  svg {
+    width: 100%;
+    height: auto;
+    display: block;
+    overflow: visible;
+  }
+
+  .box {
+    fill: var(--panel);
+    stroke: var(--panel-border);
+    stroke-width: 1.5;
+    rx: 8;
+  }
+
+  .box-accent { stroke: var(--accent); stroke-width: 1.5; }
+  .box-purple { stroke: var(--purple); stroke-width: 1.5; }
+
+  .label {
+    fill: var(--text);
+    font-size: 13px;
+    font-weight: 600;
+    font-family: inherit;
+  }
+
+  .sublabel {
+    fill: var(--text-dim);
+    font-size: 10.5px;
+    font-family: var(--mono);
+  }
+
+  .group-label {
+    fill: var(--text-dim);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    font-family: inherit;
+  }
+
+  .group-box {
+    fill: none;
+    stroke: var(--panel-border);
+    stroke-width: 1;
+    stroke-dasharray: 4 3;
+    rx: 10;
+  }
+
+  .arrow {
+    stroke: var(--text-dim);
+    stroke-width: 1.5;
+    fill: none;
+    marker-end: url(#arrowhead);
+  }
+
+  .arrow-accent {
+    stroke: var(--accent);
+    stroke-width: 1.5;
+    fill: none;
+    marker-end: url(#arrowhead-accent);
+  }
+
+  .arrow-write {
+    stroke: var(--purple);
+    stroke-width: 1.5;
+    fill: none;
+    stroke-dasharray: 5 3;
+    marker-end: url(#arrowhead-purple);
+  }
+
+  .arrow-dotted {
+    stroke: var(--text-dim);
+    stroke-width: 1.2;
+    fill: none;
+    stroke-dasharray: 3 3;
+    marker-end: url(#arrowhead);
+    opacity: 0.7;
+  }
+
+  .arrow-label {
+    fill: var(--text-dim);
+    font-size: 10px;
+    font-family: var(--mono);
+  }
+
+  .pill { fill: var(--accent-dim); rx: 10; }
+  .pill-text { fill: var(--accent); font-size: 10px; font-weight: 600; font-family: var(--mono); }
+
+  .legend-line { stroke-width: 1.5; }
+  .legend-text { fill: var(--text-dim); font-size: 11px; font-family: inherit; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>VM Power Scheduler — Logical Architecture</h1>
+  <p class="subtitle">Component interplay: schedule registration, the every-minute collector tick, batched dispatch, and execution.</p>
+
+  <svg viewBox="0 0 1320 860" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <marker id="arrowhead" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+        <path d="M0,0 L6,3 L0,6 Z" fill="#8b98a5"/>
+      </marker>
+      <marker id="arrowhead-accent" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+        <path d="M0,0 L6,3 L0,6 Z" fill="#5fb3d9"/>
+      </marker>
+      <marker id="arrowhead-purple" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+        <path d="M0,0 L6,3 L0,6 Z" fill="#bc8cff"/>
+      </marker>
+    </defs>
+
+    <!-- ============ ROW 1: TFE + API + FLOWER ============ -->
+
+    <!-- Terraform -->
+    <rect x="20" y="30" width="250" height="120" rx="8" class="box box-accent"/>
+    <text x="40" y="58" class="label">Terraform Enterprise</text>
+    <text x="40" y="80" class="sublabel">module "vm_schedule" { ... }</text>
+    <text x="40" y="98" class="sublabel">power_on_hour, power_off_hour,</text>
+    <text x="40" y="112" class="sublabel">timezone, blackout_periods</text>
+    <rect x="40" y="122" width="125" height="18" class="pill"/>
+    <text x="48" y="135" class="pill-text">mastercard/restapi</text>
+
+    <!-- TFE -> API -->
+    <path d="M 270 85 L 360 85" class="arrow-accent"/>
+    <text x="278" y="78" class="arrow-label">POST / DELETE /schedule</text>
+
+    <!-- API -->
+    <rect x="360" y="30" width="270" height="120" rx="8" class="box box-accent"/>
+    <text x="380" y="58" class="label">FastAPI — vm-scheduler</text>
+    <text x="380" y="80" class="sublabel">Validates schedule request</text>
+    <text x="380" y="96" class="sublabel">Upserts vm_schedules row</text>
+    <text x="380" y="112" class="sublabel">/calendars · /schedules/summary</text>
+    <text x="380" y="128" class="sublabel">/healthz — checks Postgres</text>
+
+    <!-- API -> redbeat registration -->
+    <path d="M 630 70 Q 760 70 760 140" class="arrow"/>
+    <text x="660" y="58" class="arrow-label">on startup: register</text>
+    <text x="660" y="70" class="arrow-label">collector tick (redbeat, expires=60s)</text>
+
+    <!-- API -> Postgres -->
+    <path d="M 495 150 L 495 230" class="arrow"/>
+    <text x="503" y="195" class="arrow-label">upsert / delete</text>
+
+    <!-- Flower -->
+    <rect x="20" y="190" width="270" height="110" rx="8" class="box"/>
+    <text x="40" y="218" class="label" font-size="13">Flower</text>
+    <text x="40" y="240" class="sublabel">Task dashboard</text>
+    <text x="40" y="256" class="sublabel">success / retry / expired</text>
+    <text x="40" y="272" class="sublabel">per-task arguments &amp; state</text>
+    <path d="M 290 250 Q 500 250 700 500" class="arrow-dotted"/>
+    <text x="370" y="245" class="arrow-label">observes task events</text>
+
+    <!-- ============ POSTGRES ============ -->
+    <rect x="360" y="230" width="270" height="150" rx="8" class="box"/>
+    <text x="380" y="258" class="label">PostgreSQL</text>
+    <text x="396" y="278" class="sublabel" font-weight="600" fill="#e6edf3">vm_schedules</text>
+    <text x="396" y="294" class="sublabel" font-style="italic">schedule · blackout_periods</text>
+    <text x="396" y="308" class="sublabel" font-style="italic">role_arn / subscription_id / vcenter</text>
+    <rect x="396" y="318" width="218" height="1" fill="var(--panel-border)"/>
+    <text x="396" y="336" class="sublabel" font-weight="600" fill="#e6edf3">execution_log</text>
+    <text x="396" y="352" class="sublabel" font-style="italic">result · detail · executed_at</text>
+    <text x="610" y="252" class="sublabel" text-anchor="end" fill="#3fb950">existing backup ✓</text>
+
+    <!-- ============ CELERY / REDIS GROUP ============ -->
+    <rect x="700" y="20" width="580" height="290" rx="10" class="group-box"/>
+    <text x="716" y="8" class="group-label">Celery — Redis-backed</text>
+
+    <!-- Redis -->
+    <rect x="730" y="140" width="240" height="100" rx="8" class="box"/>
+    <text x="750" y="168" class="label">Redis</text>
+    <text x="750" y="190" class="sublabel">Broker + result backend</text>
+    <text x="750" y="206" class="sublabel">redbeat schedule store</text>
+    <text x="750" y="222" class="sublabel">blackout:calendars (JSON)</text>
+
+    <!-- Beat -->
+    <rect x="1010" y="140" width="250" height="100" rx="8" class="box box-accent"/>
+    <text x="1030" y="168" class="label">Celery Beat</text>
+    <text x="1030" y="190" class="sublabel">redbeat scheduler</text>
+    <text x="1030" y="206" class="sublabel">single collector tick,</text>
+    <text x="1030" y="222" class="sublabel">fires every minute</text>
+
+    <!-- Redis <-> Beat -->
+    <path d="M 970 175 L 1010 175" class="arrow-accent"/>
+    <text x="972" y="172" class="arrow-label" text-anchor="end">reads</text>
+    <path d="M 1010 205 L 970 205" class="arrow"/>
+
+    <!-- Beat -> enqueue collector task -->
+    <path d="M 1135 240 L 1135 270 L 970 270" class="arrow-accent"/>
+    <text x="980" y="263" class="arrow-label">enqueue collect_and_dispatch</text>
+
+    <!-- collector worker -->
+    <rect x="730" y="250" width="240" height="60" rx="8" class="box box-accent"/>
+    <text x="750" y="275" class="label" font-size="12">collect_and_dispatch</text>
+    <text x="750" y="293" class="sublabel">reads vm_schedules, groups by</text>
+    <text x="750" y="306" class="sublabel">role_arn / subscription / vcenter</text>
+
+    <!-- collector -> postgres read -->
+    <path d="M 730 295 Q 645 340 630 320" class="arrow"/>
+    <text x="640" y="345" class="arrow-label">SELECT * FROM vm_schedules</text>
+
+    <!-- collector -> blackout check (redis) -->
+    <path d="M 850 250 L 850 240" class="arrow"/>
+    <text x="858" y="245" class="arrow-label">is_blackout()</text>
+
+    <!-- ============ WORKER POOL ============ -->
+    <rect x="700" y="430" width="580" height="200" rx="10" class="group-box"/>
+    <text x="716" y="418" class="group-label">Celery Workers — scale horizontally</text>
+
+    <!-- dispatch arrows from collector to workers -->
+    <path d="M 850 310 L 850 450" class="arrow-accent"/>
+    <text x="858" y="385" class="arrow-label">apply_async(expires=300s)</text>
+
+    <rect x="730" y="450" width="160" height="80" rx="8" class="box" style="stroke: var(--aws-color)"/>
+    <text x="748" y="478" class="label" font-size="12">aws_batch_power</text>
+    <text x="748" y="498" class="sublabel">group by</text>
+    <text x="748" y="512" class="sublabel">(role_arn, region)</text>
+
+    <rect x="910" y="450" width="160" height="80" rx="8" class="box" style="stroke: var(--azure-color)"/>
+    <text x="928" y="478" class="label" font-size="12">azure_batch_power</text>
+    <text x="928" y="498" class="sublabel">group by</text>
+    <text x="928" y="512" class="sublabel">subscription_id</text>
+
+    <rect x="1090" y="450" width="160" height="80" rx="8" class="box" style="stroke: var(--vmware-color)"/>
+    <text x="1108" y="478" class="label" font-size="12">vmware_single_power</text>
+    <text x="1108" y="498" class="sublabel">per-VM dispatch,</text>
+    <text x="1108" y="512" class="sublabel">Redis lock per vCenter</text>
+
+    <!-- workers write back to postgres (audit) -->
+    <path d="M 810 530 Q 600 660 630 380" class="arrow-write"/>
+    <path d="M 990 530 Q 700 690 630 380" class="arrow-write"/>
+    <path d="M 1170 530 Q 800 720 630 380" class="arrow-write"/>
+    <text x="540" y="410" class="arrow-label" fill="#bc8cff">execution_log +</text>
+    <text x="540" y="422" class="arrow-label" fill="#bc8cff">last_*_result</text>
+
+    <!-- ============ CLOUD PROVIDERS ============ -->
+    <rect x="700" y="730" width="580" height="110" rx="10" class="group-box"/>
+    <text x="716" y="718" class="group-label">Target Infrastructure</text>
+
+    <rect x="730" y="750" width="170" height="70" rx="8" class="box"/>
+    <text x="748" y="775" class="label" font-size="12" fill="var(--aws-color)">AWS EC2</text>
+    <text x="748" y="795" class="sublabel">STS AssumeRole(role_arn)</text>
+    <text x="748" y="809" class="sublabel">Start/StopInstances (≤100)</text>
+
+    <rect x="915" y="750" width="180" height="70" rx="8" class="box"/>
+    <text x="933" y="775" class="label" font-size="12" fill="var(--azure-color)">Azure Compute</text>
+    <text x="933" y="795" class="sublabel">8 concurrent/subscription</text>
+    <text x="933" y="809" class="sublabel">Retry-After honoured</text>
+
+    <rect x="1110" y="750" width="170" height="70" rx="8" class="box"/>
+    <text x="1128" y="775" class="label" font-size="12" fill="var(--vmware-color)">vCenter</text>
+    <text x="1128" y="795" class="sublabel">pyVmomi PowerOn/OffVM_Task</text>
+    <text x="1128" y="809" class="sublabel">per-vCenter lock honoured</text>
+
+    <!-- worker -> provider arrows -->
+    <path d="M 810 530 L 810 750" class="arrow"/>
+    <path d="M 990 530 L 1005 750" class="arrow"/>
+    <path d="M 1170 530 L 1195 750" class="arrow"/>
+
+    <!-- ============ EXPIRY / RESILIENCE NOTE ============ -->
+    <rect x="20" y="430" width="600" height="170" rx="8" class="box box-purple"/>
+    <text x="40" y="460" class="label" font-size="13">If all workers are down</text>
+    <text x="40" y="486" class="sublabel">• Collector tick expires after 60s — stale ticks are dropped,</text>
+    <text x="56" y="502" class="sublabel">not all fired back-to-back on recovery.</text>
+    <text x="40" y="524" class="sublabel">• Batch power tasks expire after 300s — a missed power on/off</text>
+    <text x="56" y="540" class="sublabel">simply doesn't happen for that cycle; VM stays in its current</text>
+    <text x="56" y="556" class="sublabel">state until the next scheduled minute.</text>
+    <text x="40" y="580" class="sublabel">• task_revoked signal writes result="expired" to execution_log</text>
+    <text x="56" y="596" class="sublabel">per VM — visible in /schedules/summary, nothing vanishes silently.</text>
+
+    <path d="M 620 500 Q 660 480 730 320" class="arrow-write" stroke-dasharray="3 3"/>
+
+    <!-- ============ LEGEND ============ -->
+    <g transform="translate(40, 660)">
+      <line x1="0" y1="0" x2="36" y2="0" class="arrow legend-line"/>
+      <text x="44" y="4" class="legend-text">API / read / control flow</text>
+
+      <line x1="0" y1="26" x2="36" y2="26" class="arrow-accent legend-line"/>
+      <text x="44" y="30" class="legend-text">schedule registration &amp; task dispatch</text>
+
+      <line x1="0" y1="52" x2="36" y2="52" class="arrow-write legend-line" stroke-dasharray="5 3"/>
+      <text x="44" y="56" class="legend-text">audit / result writes to execution_log</text>
+    </g>
+
+  </svg>
+</div>
+</body>
+</html>

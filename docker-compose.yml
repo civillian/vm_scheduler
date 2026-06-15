@@ -1,0 +1,96 @@
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: scheduler
+      POSTGRES_USER: scheduler
+      POSTGRES_PASSWORD: scheduler
+    # No host port binding — only other containers need to reach this,
+    # via the service name "postgres" on the compose network.
+    # Avoids clashing with a Postgres already running on the host.
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    # No init SQL mount — the API creates tables via SQLAlchemy
+    # (db.init_db()) on startup. migrations/001_init.sql is kept as a
+    # reference/DR document, not a load-bearing init script.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scheduler"]
+      interval: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    # No host port binding — internal to the compose network only.
+    # Avoids clashing with a Redis already running on the host.
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 5
+
+  api:
+    build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      # Bind to the LAN-facing IP only — avoids Docker's default
+      # 0.0.0.0 binding, which can expose this on internet-facing
+      # interfaces depending on host firewall/NAT setup.
+      # Change 192.168.100.1 to your host's LAN IP, or remove this
+      # ports section entirely and use an SSH tunnel instead.
+      - "192.168.100.1:8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://scheduler:scheduler@postgres:5432/scheduler
+      - VCENTER_USER=${VCENTER_USER}
+      - VCENTER_PASSWORD=${VCENTER_PASSWORD}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: .
+    command: celery -A workers.celery_app worker --loglevel=info --concurrency=4
+    environment:
+      - DATABASE_URL=postgresql://scheduler:scheduler@postgres:5432/scheduler
+      - VCENTER_USER=${VCENTER_USER}
+      - VCENTER_PASSWORD=${VCENTER_PASSWORD}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      replicas: 2
+
+  beat:
+    build: .
+    command: celery -A workers.celery_app beat --scheduler redbeat.RedBeatScheduler --loglevel=info
+    environment:
+      - DATABASE_URL=postgresql://scheduler:scheduler@postgres:5432/scheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      replicas: 1
+
+  flower:
+    build: .
+    command: celery -A workers.celery_app flower --port=5555
+    ports:
+      # Same reasoning as the api service — LAN-facing IP only.
+      - "192.168.100.1:5555:5555"
+    environment:
+      - DATABASE_URL=postgresql://scheduler:scheduler@postgres:5432/scheduler
+    depends_on:
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  redis_data:
