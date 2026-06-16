@@ -2,7 +2,8 @@ from pyVim.connect import SmartConnect, Disconnect
 from pyVmomi import vim
 import ssl
 import logging
-import os
+
+from workers.vault import get_vcenter_credentials
 
 logger = logging.getLogger(__name__)
 
@@ -19,13 +20,15 @@ def _get_vm(si, vm_id: str):
 
 
 def _connect(vcenter_host: str):
+    username, password = get_vcenter_credentials()
+
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE  # TODO: use proper cert in production
     return SmartConnect(
         host=vcenter_host,
-        user=os.environ["VCENTER_USER"],
-        pwd=os.environ["VCENTER_PASSWORD"],
+        user=username,
+        pwd=password,
         sslContext=context,
     )
 

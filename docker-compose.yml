@@ -1,3 +1,5 @@
+name: vm-scheduler
+
 services:
 
   postgres:
@@ -43,8 +45,11 @@ services:
       - "192.168.100.1:8000:8000"
     environment:
       - DATABASE_URL=postgresql://scheduler:scheduler@postgres:5432/scheduler
-      - VCENTER_USER=${VCENTER_USER}
-      - VCENTER_PASSWORD=${VCENTER_PASSWORD}
+      - VAULT_ADDR=${VAULT_ADDR}
+      - VAULT_TOKEN=${VAULT_TOKEN}
+      - VAULT_NAMESPACE=${VAULT_NAMESPACE}
+      - VAULT_AWS_CRED_PATH=${VAULT_AWS_CRED_PATH}
+      - VAULT_VCENTER_CRED_PATH=${VAULT_VCENTER_CRED_PATH}
     depends_on:
       postgres:
         condition: service_healthy
@@ -56,8 +61,11 @@ services:
     command: celery -A workers.celery_app worker --loglevel=info --concurrency=4
     environment:
       - DATABASE_URL=postgresql://scheduler:scheduler@postgres:5432/scheduler
-      - VCENTER_USER=${VCENTER_USER}
-      - VCENTER_PASSWORD=${VCENTER_PASSWORD}
+      - VAULT_ADDR=${VAULT_ADDR}
+      - VAULT_TOKEN=${VAULT_TOKEN}
+      - VAULT_NAMESPACE=${VAULT_NAMESPACE}
+      - VAULT_AWS_CRED_PATH=${VAULT_AWS_CRED_PATH}
+      - VAULT_VCENTER_CRED_PATH=${VAULT_VCENTER_CRED_PATH}
     depends_on:
       postgres:
         condition: service_healthy

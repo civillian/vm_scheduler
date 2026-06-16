@@ -13,6 +13,9 @@ celery-redbeat==2.2.0
 redis==5.1.0
 flower==2.0.1
 
+# Vault
+hvac==2.3.0
+
 # Providers
 boto3==1.35.0
 azure-identity==1.18.0

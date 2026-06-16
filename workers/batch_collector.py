@@ -288,6 +288,69 @@ def vmware_single_power(self, action: str, vm: dict):
 
 
 # ---------------------------------------------------------------------------
+# Failure handling — connection/credential-level errors
+# ---------------------------------------------------------------------------
+#
+# _write_log() inside each batch task only runs for per-VM ERROR results
+# returned by aws_batch_action/azure_batch_action — i.e. failures that
+# happen *after* a connection was established (e.g. an individual
+# instance ID not found).
+#
+# Connection or credential-level failures (bad role_arn, expired creds,
+# network unreachable, NoCredentialsError, etc.) raise *before* any
+# results dict is returned. These propagate through autoretry_for and,
+# once max_retries is exhausted, the task simply fails — with nothing
+# written to execution_log unless we catch it here.
+#
+# task_failure fires once, after retries are exhausted, for every task
+# that ends in permanent failure. This is the backstop that ensures
+# every VM in the batch gets an "error" row regardless of which layer
+# the failure occurred in.
+
+from celery.signals import task_failure
+
+
+@task_failure.connect
+def _on_task_failure(sender=None, task_id=None, exception=None, args=None, **kwargs):
+    task_name = getattr(sender, "name", "") or ""
+    if "batch_collector" not in task_name:
+        return
+    if task_name.endswith("collect_and_dispatch"):
+        return  # no per-VM args to extract
+
+    # Partial batch failures (aws_batch_power / azure_batch_power) already
+    # call _write_log per-VM with specific error details before raising
+    # this RuntimeError — don't double-log with a generic message.
+    if isinstance(exception, RuntimeError) and "Partial batch failure" in str(exception):
+        return
+
+    if not args or len(args) != 2:
+        return
+
+    action, vms = args
+    if task_name.endswith("vmware_single_power"):
+        vms = [vms]   # single VM dict, not a list
+
+    if not isinstance(vms, list):
+        return
+
+    detail = f"ERROR: {exception}" if exception else "Task failed permanently after retries"
+
+    for vm in vms:
+        try:
+            logger.error(
+                "Task failed permanently: vm=%s action=power_%s task=%s error=%s",
+                vm.get("vm_id"), action, task_name, exception
+            )
+            _write_log(
+                vm.get("vm_id"), vm.get("provider", "unknown"),
+                action, "error", detail
+            )
+        except Exception:
+            logger.exception("Failed to write failure log for vm=%s", vm.get("vm_id"))
+
+
+# ---------------------------------------------------------------------------
 # Expiry handling
 # ---------------------------------------------------------------------------
 
