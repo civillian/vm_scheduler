@@ -10,7 +10,6 @@ Returns per-VM results so the batch collector can track partial failures.
 import boto3
 import logging
 from itertools import islice
-from typing import Literal
 
 from workers.vault import get_aws_master_credentials
 
@@ -63,25 +62,24 @@ def _ec2_client(region: str, role_arn: str | None = None):
 
 
 def aws_batch_action(
-    action: Literal["start", "stop"],
-    vms: list[dict],   # each: {vm_id, region, role_arn, ...}
+    action: str,   # "on" or "off" — canonical strings from the collector
+    vms: list[dict],
 ) -> dict[str, str]:
     """
-    Execute a start or stop action for a list of VMs that share the same
-    (role_arn, region). Batches up to 100 IDs per API call.
+    Execute a power-on or power-off action for a list of VMs that share
+    the same (role_arn, region). Batches up to 100 IDs per API call.
 
-    Returns a dict of {vm_id: final_state_or_error}.
+    Returns a dict of {vm_id: detail_or_error}.
     """
     if not vms:
         return {}
 
-    # All VMs in this call share the same role/region — take from first entry
     region   = vms[0]["region"]
     role_arn = vms[0].get("role_arn")
     ids      = [vm["vm_id"] for vm in vms]
 
     logger.info(
-        "AWS batch %s: role_arn=%s region=%s count=%d",
+        "AWS batch power_%s: role_arn=%s region=%s count=%d",
         action, role_arn, region, len(ids)
     )
 
@@ -90,25 +88,31 @@ def aws_batch_action(
 
     for chunk in _chunked(ids, AWS_BATCH_SIZE):
         try:
-            if action == "stop":
+            if action == "off":
                 resp = client.stop_instances(InstanceIds=chunk)
                 for item in resp["StoppingInstances"]:
-                    results[item["InstanceId"]] = item["CurrentState"]["Name"]
+                    # AWS returns the state at the moment of the API call —
+                    # typically "running" or "stopping" since stop is async.
+                    # "success" means the stop was accepted, not yet completed.
+                    results[item["InstanceId"]] = (
+                        f"stop accepted — transitioning to {item['CurrentState']['Name']}"
+                    )
             else:
                 resp = client.start_instances(InstanceIds=chunk)
                 for item in resp["StartingInstances"]:
-                    results[item["InstanceId"]] = item["CurrentState"]["Name"]
+                    results[item["InstanceId"]] = (
+                        f"start accepted — transitioning to {item['CurrentState']['Name']}"
+                    )
 
             logger.info(
-                "AWS batch %s chunk complete: role_arn=%s region=%s ids=%s",
+                "AWS batch power_%s chunk complete: role_arn=%s region=%s ids=%s",
                 action, role_arn, region, list(results.keys())
             )
         except Exception as exc:
             logger.error(
-                "AWS batch %s failed: role_arn=%s region=%s chunk=%s error=%s",
+                "AWS batch power_%s failed: role_arn=%s region=%s chunk=%s error=%s",
                 action, role_arn, region, chunk, exc
             )
-            # Mark every VM in the failed chunk so the collector can retry them
             for vm_id in chunk:
                 results[vm_id] = f"ERROR: {exc}"
 

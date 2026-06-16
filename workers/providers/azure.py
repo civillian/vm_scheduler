@@ -9,7 +9,6 @@ respecting the Retry-After header on 429 responses.
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Literal
 
 from azure.core.exceptions import HttpResponseError
 from azure.identity import DefaultAzureCredential
@@ -34,24 +33,26 @@ def _compute_client(subscription_id: str) -> ComputeManagementClient:
 
 def _do_single_action(
     client: ComputeManagementClient,
-    action: Literal["start", "stop"],
+    action: str,   # "on" or "off" — canonical strings from the collector
     vm_id: str,
     resource_group: str,
 ) -> str:
     """
     Perform a single VM start or deallocate, with Retry-After handling.
-    Returns the final state string or raises on unrecoverable error.
+    Returns a detail string or raises on unrecoverable error.
     """
     attempts = 0
     while True:
         try:
             attempts += 1
-            if action == "stop":
+            if action == "off":
                 poller = client.virtual_machines.begin_deallocate(resource_group, vm_id)
+                poller.result()
+                return "deallocated"
             else:
                 poller = client.virtual_machines.begin_start(resource_group, vm_id)
-            poller.result()
-            return "deallocated" if action == "stop" else "running"
+                poller.result()
+                return "running"
 
         except HttpResponseError as exc:
             if exc.status_code == 429:
@@ -74,7 +75,7 @@ def _do_single_action(
 
 
 def azure_batch_action(
-    action: Literal["start", "stop"],
+    action: str,   # "on" or "off" — canonical strings from the collector
     vms: list[dict],   # each: {vm_id, subscription_id, resource_group, ...}
 ) -> dict[str, str]:
     """
