@@ -1,0 +1,51 @@
+{{- if .Values.route.enabled }}
+---
+# API Route
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: {{ include "vm-scheduler.fullname" . }}-api
+  labels:
+    {{- include "vm-scheduler.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  host: {{ .Values.route.api.host | quote }}
+  to:
+    kind: Service
+    name: {{ include "vm-scheduler.fullname" . }}-api
+  port:
+    targetPort: http
+  {{- with .Values.route.api.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  # Restrict mutating methods at the route level.
+  # POST/PUT/DELETE are only permitted from within the cluster
+  # (via the ClusterIP service directly), not via this route.
+  # [NOTE] OpenShift route-level method filtering requires a custom
+  # HAProxy annotation or an nginx-based ingress controller.
+  # For OpenShift with HAProxy router, use the annotation below:
+  # haproxy.router.openshift.io/ip_whitelist: "10.0.0.0/8 172.16.0.0/12"
+---
+# Flower Route
+{{- if .Values.flower.enabled }}
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: {{ include "vm-scheduler.fullname" . }}-flower
+  labels:
+    {{- include "vm-scheduler.labels" . | nindent 4 }}
+    app.kubernetes.io/component: flower
+spec:
+  host: {{ .Values.route.flower.host | quote }}
+  to:
+    kind: Service
+    name: {{ include "vm-scheduler.fullname" . }}-flower
+  port:
+    targetPort: http
+  {{- with .Values.route.flower.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
+{{- end }}

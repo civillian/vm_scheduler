@@ -1,0 +1,236 @@
+# =============================================================================
+# vm-scheduler Helm values
+#
+# Defaults are suitable for AKS (devtest). Override per environment:
+#   helm install vm-scheduler ./helm/vm-scheduler -f values-prod.yaml
+#
+# For OpenShift, see comments marked [OpenShift] throughout.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Image
+# ---------------------------------------------------------------------------
+image:
+  repository: your-registry.example.com/vm-scheduler
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+  # - name: regcred
+
+# ---------------------------------------------------------------------------
+# API service
+# ---------------------------------------------------------------------------
+api:
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  # Liveness/readiness probe — hits /healthz which checks Postgres connectivity
+  probes:
+    liveness:
+      initialDelaySeconds: 15
+      periodSeconds: 30
+    readiness:
+      initialDelaySeconds: 10
+      periodSeconds: 10
+
+# ---------------------------------------------------------------------------
+# Worker
+# ---------------------------------------------------------------------------
+worker:
+  replicaCount: 2
+  concurrency: 4    # Celery worker --concurrency
+  resources:
+    requests:
+      cpu: 200m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 512Mi
+
+# ---------------------------------------------------------------------------
+# Beat (scheduler)
+# Always runs as a single replica — redbeat lock prevents duplicate firing,
+# but a single pod is the safest default.
+# ---------------------------------------------------------------------------
+beat:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+# ---------------------------------------------------------------------------
+# Flower (task dashboard)
+# ---------------------------------------------------------------------------
+flower:
+  enabled: true
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+# ---------------------------------------------------------------------------
+# Ingress
+# Exposes the API and Flower dashboard.
+# POST /schedule and DELETE /schedule/* are restricted to internal cluster
+# traffic only (see nginx annotations below) — public access is GET-only.
+# ---------------------------------------------------------------------------
+ingress:
+  enabled: true
+  # [OpenShift] Set to false and use route.enabled instead
+  className: nginx
+  annotations:
+    # Restrict mutating endpoints to cluster-internal traffic.
+    # This prevents unauthenticated schedule registration from outside
+    # the cluster while keeping GET (status/summary/history) accessible.
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      if ($request_method ~ ^(POST|PUT|DELETE)$) {
+        return 403;
+      }
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+  hosts:
+    - host: vm-scheduler.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+          service: api
+    - host: vm-scheduler-flower.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+          service: flower
+  tls: []
+  #  - secretName: vm-scheduler-tls
+  #    hosts:
+  #      - vm-scheduler.example.com
+
+# ---------------------------------------------------------------------------
+# OpenShift Routes
+# [OpenShift] Set ingress.enabled: false and enable these instead.
+# ---------------------------------------------------------------------------
+route:
+  enabled: false
+  api:
+    host: vm-scheduler.apps.your-cluster.example.com
+    tls:
+      termination: edge
+  flower:
+    host: vm-scheduler-flower.apps.your-cluster.example.com
+    tls:
+      termination: edge
+
+# ---------------------------------------------------------------------------
+# PostgreSQL
+# For production, point at your existing managed Postgres instance.
+# For devtest, enable the bundled Postgres subchart (bitnami).
+# ---------------------------------------------------------------------------
+postgresql:
+  # Set to false for production — use externalDatabase instead
+  enabled: true
+  auth:
+    username: scheduler
+    password: scheduler
+    database: scheduler
+  primary:
+    persistence:
+      size: 5Gi
+
+# External Postgres (used when postgresql.enabled: false)
+externalDatabase:
+  host: ""
+  port: 5432
+  username: scheduler
+  password: ""
+  database: scheduler
+
+# ---------------------------------------------------------------------------
+# Redis
+# For production, point at your existing managed Redis instance.
+# For devtest, enable the bundled Redis subchart (bitnami).
+# ---------------------------------------------------------------------------
+redis:
+  # Set to false for production — use externalRedis instead
+  enabled: true
+  auth:
+    enabled: false
+  master:
+    persistence:
+      size: 2Gi
+
+# External Redis (used when redis.enabled: false)
+externalRedis:
+  host: ""
+  port: 6379
+
+# ---------------------------------------------------------------------------
+# Vault configuration
+# All Vault env vars are injected as a Kubernetes Secret (vault-credentials).
+# ---------------------------------------------------------------------------
+vault:
+  addr: ""            # VAULT_ADDR  e.g. https://vault.example.com
+  token: ""           # VAULT_TOKEN — use a Vault agent sidecar or external-secrets in prod
+  namespace: ""       # VAULT_NAMESPACE (Vault Enterprise)
+  awsCredPath: ""     # VAULT_AWS_CRED_PATH  e.g. aws_central_auth/common
+  vcenterCredPath: "" # VAULT_VCENTER_CRED_PATH  e.g. vsphere_auth/common
+
+# ---------------------------------------------------------------------------
+# Proxy configuration
+# Set these if the cluster routes outbound traffic through a proxy.
+# ---------------------------------------------------------------------------
+proxy:
+  httpProxy: ""
+  httpsProxy: ""
+  noProxy: ""         # Comma-separated — include vCenter hosts, Vault host,
+                      # and AWS PrivateLink endpoints
+  requestsCaBundle: "" # Path to CA bundle inside the container
+  awsCaBundle: ""      # Path to CA bundle for boto3 (often same as above)
+
+# ---------------------------------------------------------------------------
+# Security context
+# [OpenShift] openshift.enabled: true drops the securityContext entirely
+# and lets OpenShift assign a random UID — required by the default SCC.
+# For AKS, runs as non-root (uid 1000).
+# ---------------------------------------------------------------------------
+openshift:
+  enabled: false
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+
+# ---------------------------------------------------------------------------
+# Service account
+# ---------------------------------------------------------------------------
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+    # For AKS Workload Identity or IRSA (if needed):
+    # azure.workload.identity/client-id: "xxx"
+    # eks.amazonaws.com/role-arn: "arn:aws:iam::xxx:role/xxx"
+
+# ---------------------------------------------------------------------------
+# Pod annotations / labels
+# ---------------------------------------------------------------------------
+podAnnotations: {}
+podLabels: {}
+
+# ---------------------------------------------------------------------------
+# Node selector / tolerations / affinity
+# ---------------------------------------------------------------------------
+nodeSelector: {}
+tolerations: []
+affinity: {}

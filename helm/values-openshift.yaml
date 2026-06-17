@@ -1,0 +1,77 @@
+# values-openshift.yaml
+# Override values for OpenShift ction environment.
+# Usage: helm install vm-scheduler ./helm/vm-scheduler -f values-openshift.yaml
+
+image:
+  repository: your-registry.example.com/vm-scheduler
+  tag: "0.1.0"
+
+imagePullSecrets:
+  - name: registry-pull-secret
+
+# Production: use external managed Postgres and Redis
+postgresql:
+  enabled: false
+redis:
+  enabled: false
+
+externalDatabase:
+  host: "postgres.internal.example.com"
+  port: 5432
+  username: scheduler
+  # password: set via --set or external-secrets
+  database: scheduler
+
+externalRedis:
+  host: "redis.internal.example.com"
+  port: 6379
+
+# OpenShift Routes — ingress disabled, use Routes instead
+ingress:
+  enabled: false
+
+route:
+  enabled: true
+  api:
+    host: vm-scheduler.apps.your-cluster.example.com
+    tls:
+      termination: edge
+      insecureEdgeTerminationPolicy: Redirect
+  flower:
+    host: vm-scheduler-flower.apps.your-cluster.example.com
+    tls:
+      termination: edge
+      insecureEdgeTerminationPolicy: Redirect
+
+# [OpenShift] Drop securityContext entirely — OpenShift SCC assigns
+# a random UID automatically. Setting runAsUser conflicts with the
+# restricted SCC and will cause pod scheduling failures.
+openshift:
+  enabled: true
+
+# Vault — populate via external-secrets or vault-agent-injector
+vault:
+  addr: "https://vault.example.com"
+  namespace: "your-namespace"
+  awsCredPath: "aws_central_auth/common"
+  vcenterCredPath: "vsphere_auth/common"
+  # token: managed by vault-agent sidecar in ction
+
+# Proxy
+proxy:
+  httpsProxy: "http://proxy.example.com:8080"
+  noProxy: "10.0.0.0/8,172.16.0.0/12,vcenter.internal.example.com,vault.example.com,*.amazonaws.com"
+  requestsCaBundle: "/etc/ssl/certs/ca-certificates.crt"
+  awsCaBundle: "/etc/ssl/certs/ca-certificates.crt"
+
+# Scale up for ction fleet
+worker:
+  replicaCount: 3
+  concurrency: 4
+  resources:
+    requests:
+      cpu: 200m
+      memory: 384Mi
+    limits:
+      cpu: 1000m
+      memory: 768Mi
