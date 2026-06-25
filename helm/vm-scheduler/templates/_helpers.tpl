@@ -21,16 +21,10 @@ Create a default fully qualified app name.
 {{- end }}
 {{- end }}
 
-{{/*
-Chart label
-*/}}
 {{- define "vm-scheduler.chart" -}}
 {{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
-{{/*
-Common labels
-*/}}
 {{- define "vm-scheduler.labels" -}}
 helm.sh/chart: {{ include "vm-scheduler.chart" . }}
 {{ include "vm-scheduler.selectorLabels" . }}
@@ -40,17 +34,11 @@ app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end }}
 
-{{/*
-Selector labels
-*/}}
 {{- define "vm-scheduler.selectorLabels" -}}
 app.kubernetes.io/name: {{ include "vm-scheduler.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
-{{/*
-Service account name
-*/}}
 {{- define "vm-scheduler.serviceAccountName" -}}
 {{- if .Values.serviceAccount.create }}
 {{- default (include "vm-scheduler.fullname" .) .Values.serviceAccount.name }}
@@ -60,7 +48,7 @@ Service account name
 {{- end }}
 
 {{/*
-Database URL — uses bundled Postgres if enabled, otherwise externalDatabase
+Database URL — bundled Postgres or external
 */}}
 {{- define "vm-scheduler.databaseUrl" -}}
 {{- if .Values.postgresql.enabled }}
@@ -71,19 +59,8 @@ Database URL — uses bundled Postgres if enabled, otherwise externalDatabase
 {{- end }}
 
 {{/*
-Redis URL — uses bundled Redis if enabled, otherwise externalRedis
-*/}}
-{{- define "vm-scheduler.redisUrl" -}}
-{{- if .Values.redis.enabled }}
-{{- printf "redis://%s-redis-master:6379/0" (include "vm-scheduler.fullname" .) }}
-{{- else }}
-{{- printf "redis://%s:%d/0" .Values.externalRedis.host (.Values.externalRedis.port | int) }}
-{{- end }}
-{{- end }}
-
-{{/*
-Security context — empty for OpenShift (random UID assigned by SCC),
-explicit non-root for AKS.
+Security context — empty for OpenShift (SCC assigns random UID),
+explicit non-root uid 1000 for AKS.
 */}}
 {{- define "vm-scheduler.securityContext" -}}
 {{- if not .Values.openshift.enabled }}
@@ -93,7 +70,10 @@ securityContext:
 {{- end }}
 
 {{/*
-Common environment variables shared across api, worker, and beat.
+Common environment variables shared across api, worker, beat, and flower.
+Redis is configured via component parts (host/port/password/db) rather than
+a full URL, so that shared Redis instances can use specific databases without
+embedding passwords in values files.
 */}}
 {{- define "vm-scheduler.commonEnv" -}}
 - name: DATABASE_URL
@@ -101,11 +81,21 @@ Common environment variables shared across api, worker, and beat.
     secretKeyRef:
       name: {{ include "vm-scheduler.fullname" . }}-db
       key: url
-- name: CELERY_BROKER_URL
+- name: REDIS_HOST
+  value: {{ .Values.externalRedis.host | default (printf "%s-redis-master" (include "vm-scheduler.fullname" .)) | quote }}
+- name: REDIS_PORT
+  value: {{ .Values.externalRedis.port | default 6379 | quote }}
+{{- if .Values.externalRedis.password }}
+- name: REDIS_PASSWORD
   valueFrom:
     secretKeyRef:
       name: {{ include "vm-scheduler.fullname" . }}-redis
-      key: url
+      key: password
+{{- end }}
+- name: REDIS_BROKER_DB
+  value: {{ .Values.externalRedis.brokerDb | default 0 | quote }}
+- name: REDIS_RESULT_DB
+  value: {{ .Values.externalRedis.resultDb | default 1 | quote }}
 - name: VAULT_ADDR
   valueFrom:
     secretKeyRef:
@@ -122,15 +112,11 @@ Common environment variables shared across api, worker, and beat.
       name: {{ include "vm-scheduler.fullname" . }}-vault
       key: namespace
 - name: VAULT_AWS_CRED_PATH
-  valueFrom:
-    secretKeyRef:
-      name: {{ include "vm-scheduler.fullname" . }}-vault
-      key: awsCredPath
+  value: {{ .Values.vault.awsCredPath | quote }}
 - name: VAULT_VCENTER_CRED_PATH
-  valueFrom:
-    secretKeyRef:
-      name: {{ include "vm-scheduler.fullname" . }}-vault
-      key: vcenterCredPath
+  value: {{ .Values.vault.vcenterCredPath | quote }}
+- name: VAULT_AZURE_MOUNT
+  value: {{ .Values.vault.azureMount | default "azure" | quote }}
 {{- if .Values.proxy.httpProxy }}
 - name: HTTP_PROXY
   value: {{ .Values.proxy.httpProxy | quote }}

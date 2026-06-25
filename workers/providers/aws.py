@@ -1,10 +1,14 @@
 """
 AWS provider — batched per (role_arn, region).
 
-Master AWS credentials are sourced from Vault (KV v2) and used as the
-base identity for STS AssumeRole — one assume-role per (role_arn, region)
-group, one start/stop call per batch of up to 100 VMs.
-Returns per-VM results so the batch collector can track partial failures.
+Credentials flow:
+  1. Fetch master AWS access/secret key from Vault KV v2
+  2. Use those to call STS AssumeRole for the per-workload role_arn
+  3. Use assumed credentials for EC2 start/stop batch call
+
+All provider-specific fields come from vm.provider_config:
+  {"role_arn": "arn:aws:iam::112233445566:role/vm-scheduler",
+   "region":   "ap-southeast-2"}
 """
 
 import boto3
@@ -15,7 +19,6 @@ from workers.vault import get_aws_master_credentials
 
 logger = logging.getLogger(__name__)
 
-# AWS hard limit for instance IDs per StartInstances/StopInstances call
 AWS_BATCH_SIZE = 100
 
 
@@ -26,11 +29,6 @@ def _chunked(iterable, size):
 
 
 def _ec2_client(region: str, role_arn: str | None = None):
-    """
-    Return an EC2 client. Master credentials are fetched from Vault and
-    used to call STS AssumeRole for the target role_arn. If role_arn is
-    None, the master credentials are used directly (no assume-role).
-    """
     access_key, secret_key = get_aws_master_credentials()
 
     if role_arn:
@@ -42,7 +40,7 @@ def _ec2_client(region: str, role_arn: str | None = None):
         assumed = sts.assume_role(
             RoleArn=role_arn,
             RoleSessionName="vm-scheduler",
-            DurationSeconds=900,   # 15 min — enough for the batch
+            DurationSeconds=900,
         )
         creds = assumed["Credentials"]
         return boto3.client(
@@ -61,21 +59,18 @@ def _ec2_client(region: str, role_arn: str | None = None):
     )
 
 
-def aws_batch_action(
-    action: str,   # "on" or "off" — canonical strings from the collector
-    vms: list[dict],
-) -> dict[str, str]:
+def aws_batch_action(action: str, vms: list[dict]) -> dict[str, str]:
     """
-    Execute a power-on or power-off action for a list of VMs that share
-    the same (role_arn, region). Batches up to 100 IDs per API call.
-
-    Returns a dict of {vm_id: detail_or_error}.
+    Execute power_on or power_off for a list of VMs sharing the same
+    (role_arn, region). Batches up to 100 instance IDs per API call.
+    Returns {vm_id: detail_or_error}.
     """
     if not vms:
         return {}
 
-    region   = vms[0]["region"]
-    role_arn = vms[0].get("role_arn")
+    config   = vms[0].get("provider_config") or {}
+    region   = config.get("region", "")
+    role_arn = config.get("role_arn")
     ids      = [vm["vm_id"] for vm in vms]
 
     logger.info(
@@ -83,7 +78,7 @@ def aws_batch_action(
         action, role_arn, region, len(ids)
     )
 
-    client = _ec2_client(region, role_arn)
+    client  = _ec2_client(region, role_arn)
     results: dict[str, str] = {}
 
     for chunk in _chunked(ids, AWS_BATCH_SIZE):
@@ -91,30 +86,27 @@ def aws_batch_action(
             if action == "off":
                 resp = client.stop_instances(InstanceIds=chunk)
                 for item in resp["StoppingInstances"]:
-                    # AWS returns the state at the moment of the API call —
-                    # typically "running" or "stopping" since stop is async.
-                    # "success" means the stop was accepted, not yet completed.
                     results[item["InstanceId"]] = (
-                        f"stop accepted — transitioning to {item['CurrentState']['Name']}"
+                        f"stop accepted — transitioning to "
+                        f"{item['CurrentState']['Name']}"
                     )
             else:
                 resp = client.start_instances(InstanceIds=chunk)
                 for item in resp["StartingInstances"]:
                     results[item["InstanceId"]] = (
-                        f"start accepted — transitioning to {item['CurrentState']['Name']}"
+                        f"start accepted — transitioning to "
+                        f"{item['CurrentState']['Name']}"
                     )
-
             logger.info(
                 "AWS batch power_%s chunk complete: role_arn=%s region=%s ids=%s",
                 action, role_arn, region, list(results.keys())
             )
         except Exception as exc:
             logger.error(
-                "AWS batch power_%s failed: role_arn=%s region=%s chunk=%s error=%s",
-                action, role_arn, region, chunk, exc
+                "AWS batch power_%s failed: role_arn=%s region=%s error=%s",
+                action, role_arn, region, exc
             )
             for vm_id in chunk:
                 results[vm_id] = f"ERROR: {exc}"
 
     return results
-

@@ -1,15 +1,21 @@
-# values-openshift.yaml
-# Override values for OpenShift ction environment.
-# Usage: helm install vm-scheduler ./helm/vm-scheduler -f values-openshift.yaml
+# values-openshift.yaml — OpenShift overrides only
+# Merged on top of helm/vm-scheduler/values.yaml at install time.
+#
+# helm install vm-scheduler ./helm/vm-scheduler \
+#   -f helm/values-openshift.yaml \
+#   --set vault.addr=https://vault.example.com \
+#   --set vault.token=xxx \
+#   --set externalDatabase.password=xxx \
+#   --set externalRedis.password=xxx \
+#   -n vm-scheduler --create-namespace
 
 image:
   repository: your-registry.example.com/vm-scheduler
-  tag: "0.1.0"
 
 imagePullSecrets:
   - name: registry-pull-secret
 
-# Production: use external managed Postgres and Redis
+# External managed Postgres and Redis
 postgresql:
   enabled: false
 redis:
@@ -17,16 +23,29 @@ redis:
 
 externalDatabase:
   host: "postgres.internal.example.com"
-  port: 5432
-  username: scheduler
-  # password: set via --set or external-secrets
-  database: scheduler
+  # password: --set externalDatabase.password=xxx
 
 externalRedis:
-  host: "redis.internal.example.com"
-  port: 6379
+  host:     "redis-master.redis.svc.cluster.local"
+  port:     6379
+  brokerDb: 2   # db 0 and 1 in use by existing workloads
+  resultDb: 3
+  # password: --set externalRedis.password=xxx
 
-# OpenShift Routes — ingress disabled, use Routes instead
+# Vault — addr is environment-specific; paths and azureMount come from values.yaml
+vault:
+  addr:      "https://vault.example.com"
+  namespace: "your-namespace"
+  # token: managed by vault-agent sidecar (or --set for initial deploy)
+
+# Proxy
+proxy:
+  httpsProxy:      "http://proxy.example.com:8080"
+  noProxy:         "10.0.0.0/8,172.16.0.0/12,vault.example.com,vcenter.internal.example.com,*.amazonaws.com"
+  requestsCaBundle: "/etc/ssl/certs/ca-certificates.crt"
+  awsCaBundle:     "/etc/ssl/certs/ca-certificates.crt"
+
+# OpenShift Routes — no ingress on OpenShift
 ingress:
   enabled: false
 
@@ -34,44 +53,13 @@ route:
   enabled: true
   api:
     host: vm-scheduler.apps.your-cluster.example.com
-    tls:
-      termination: edge
-      insecureEdgeTerminationPolicy: Redirect
   flower:
     host: vm-scheduler-flower.apps.your-cluster.example.com
-    tls:
-      termination: edge
-      insecureEdgeTerminationPolicy: Redirect
 
-# [OpenShift] Drop securityContext entirely — OpenShift SCC assigns
-# a random UID automatically. Setting runAsUser conflicts with the
-# restricted SCC and will cause pod scheduling failures.
+# [OpenShift] Drop securityContext — SCC assigns random UID
 openshift:
   enabled: true
 
-# Vault — populate via external-secrets or vault-agent-injector
-vault:
-  addr: "https://vault.example.com"
-  namespace: "your-namespace"
-  awsCredPath: "aws_central_auth/common"
-  vcenterCredPath: "vsphere_auth/common"
-  # token: managed by vault-agent sidecar in ction
-
-# Proxy
-proxy:
-  httpsProxy: "http://proxy.example.com:8080"
-  noProxy: "10.0.0.0/8,172.16.0.0/12,vcenter.internal.example.com,vault.example.com,*.amazonaws.com"
-  requestsCaBundle: "/etc/ssl/certs/ca-certificates.crt"
-  awsCaBundle: "/etc/ssl/certs/ca-certificates.crt"
-
-# Scale up for ction fleet
+# Scale up for larger fleet
 worker:
   replicaCount: 3
-  concurrency: 4
-  resources:
-    requests:
-      cpu: 200m
-      memory: 384Mi
-    limits:
-      cpu: 1000m
-      memory: 768Mi

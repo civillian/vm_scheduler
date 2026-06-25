@@ -5,17 +5,15 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_DB: scheduler
-      POSTGRES_USER: scheduler
+      POSTGRES_DB:       scheduler
+      POSTGRES_USER:     scheduler
       POSTGRES_PASSWORD: scheduler
-    # No host port binding — only other containers need to reach this,
-    # via the service name "postgres" on the compose network.
-    # Avoids clashing with a Postgres already running on the host.
+    # No host port binding — internal to compose network only.
+    # Access via: docker compose exec postgres psql -U scheduler scheduler
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    # No init SQL mount — the API creates tables via SQLAlchemy
-    # (db.init_db()) on startup. migrations/001_init.sql is kept as a
-    # reference/DR document, not a load-bearing init script.
+    # Schema created by SQLAlchemy init_db() on API startup.
+    # migrations/001_init.sql kept as DR reference only.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U scheduler"]
       interval: 5s
@@ -23,8 +21,7 @@ services:
 
   redis:
     image: redis:7-alpine
-    # No host port binding — internal to the compose network only.
-    # Avoids clashing with a Redis already running on the host.
+    # No host port binding — internal to compose network only.
     volumes:
       - redis_data:/data
     command: redis-server --appendonly yes
@@ -35,37 +32,51 @@ services:
 
   api:
     build: .
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
     ports:
-      # Bind to the LAN-facing IP only — avoids Docker's default
-      # 0.0.0.0 binding, which can expose this on internet-facing
-      # interfaces depending on host firewall/NAT setup.
-      # Change 192.168.100.1 to your host's LAN IP, or remove this
-      # ports section entirely and use an SSH tunnel instead.
+      # Bind to LAN-facing IP only — avoids Docker's default 0.0.0.0 binding
+      # which can expose the service on internet-facing interfaces.
+      # Change to your host's LAN IP, or use an SSH tunnel instead.
       - "192.168.100.1:8000:8000"
     environment:
       - DATABASE_URL=postgresql://scheduler:scheduler@postgres:5432/scheduler
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_BROKER_DB=0
+      - REDIS_RESULT_DB=1
       - VAULT_ADDR=${VAULT_ADDR}
       - VAULT_TOKEN=${VAULT_TOKEN}
       - VAULT_NAMESPACE=${VAULT_NAMESPACE}
       - VAULT_AWS_CRED_PATH=${VAULT_AWS_CRED_PATH}
       - VAULT_VCENTER_CRED_PATH=${VAULT_VCENTER_CRED_PATH}
+      - VAULT_AZURE_MOUNT=${VAULT_AZURE_MOUNT:-azure}
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
 
   worker:
     build: .
-    command: celery -A workers.celery_app worker --loglevel=info --concurrency=4
+    command: celery -A workers.celery_app worker --loglevel=info --concurrency=4 -E
     environment:
       - DATABASE_URL=postgresql://scheduler:scheduler@postgres:5432/scheduler
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_BROKER_DB=0
+      - REDIS_RESULT_DB=1
       - VAULT_ADDR=${VAULT_ADDR}
       - VAULT_TOKEN=${VAULT_TOKEN}
       - VAULT_NAMESPACE=${VAULT_NAMESPACE}
       - VAULT_AWS_CRED_PATH=${VAULT_AWS_CRED_PATH}
       - VAULT_VCENTER_CRED_PATH=${VAULT_VCENTER_CRED_PATH}
+      - VAULT_AZURE_MOUNT=${VAULT_AZURE_MOUNT:-azure}
     depends_on:
       postgres:
         condition: service_healthy
@@ -79,10 +90,16 @@ services:
     command: celery -A workers.celery_app beat --scheduler redbeat.RedBeatScheduler --loglevel=info
     environment:
       - DATABASE_URL=postgresql://scheduler:scheduler@postgres:5432/scheduler
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_BROKER_DB=0
+      - REDIS_RESULT_DB=1
     depends_on:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      api:
         condition: service_healthy
     deploy:
       replicas: 1
@@ -91,10 +108,13 @@ services:
     build: .
     command: celery -A workers.celery_app flower --port=5555
     ports:
-      # Same reasoning as the api service — LAN-facing IP only.
       - "192.168.100.1:5555:5555"
     environment:
       - DATABASE_URL=postgresql://scheduler:scheduler@postgres:5432/scheduler
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_BROKER_DB=0
+      - REDIS_RESULT_DB=1
     depends_on:
       redis:
         condition: service_healthy

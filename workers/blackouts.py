@@ -37,11 +37,19 @@ import logging
 from datetime import date
 from typing import Optional
 
+import os
 import redis
 
 logger = logging.getLogger(__name__)
 
-redis_client = redis.Redis(host="redis", port=6379, decode_responses=True)
+
+def _redis_client() -> redis.Redis:
+    host     = os.environ.get("REDIS_HOST",     "redis")
+    port     = int(os.environ.get("REDIS_PORT", "6379"))
+    password = os.environ.get("REDIS_PASSWORD", "") or None
+    db       = int(os.environ.get("REDIS_BROKER_DB", "0"))
+    return redis.Redis(host=host, port=port, password=password,
+                       db=db, decode_responses=True)
 
 CALENDAR_KEY = "blackout:calendars"
 
@@ -51,12 +59,12 @@ CALENDAR_KEY = "blackout:calendars"
 # ---------------------------------------------------------------------------
 
 def _load_calendars() -> dict:
-    raw = redis_client.get(CALENDAR_KEY)
+    raw = _redis_client().get(CALENDAR_KEY)
     return json.loads(raw) if raw else {}
 
 
 def _save_calendars(calendars: dict):
-    redis_client.set(CALENDAR_KEY, json.dumps(calendars))
+    _redis_client().set(CALENDAR_KEY, json.dumps(calendars))
 
 
 def list_calendars() -> dict:

@@ -33,6 +33,17 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      initContainers:
+        - name: wait-for-api
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              until python3 -c "import urllib.request; urllib.request.urlopen('http://{{ include "vm-scheduler.fullname" . }}-api:8000/healthz', timeout=5)"; do
+                echo 'Waiting for API...'; sleep 5;
+              done
       containers:
         - name: beat
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"

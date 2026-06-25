@@ -1,9 +1,17 @@
 """
 Azure provider — per-subscription with Retry-After handling.
 
-Azure does not support batching VM power operations, so we run them
-concurrently within each subscription using a thread pool, while
-respecting the Retry-After header on 429 responses.
+Credentials flow:
+  1. Extract vault_role and tenant_id from vm.provider_config
+  2. Call Vault Azure static secrets engine to get client_id/client_secret
+  3. Authenticate to Azure using ClientSecretCredential
+  4. Run begin_deallocate (off) or begin_start (on) per VM
+
+All provider-specific fields come from vm.provider_config:
+  {"tenant_id":       "...",
+   "subscription_id": "...",
+   "resource_group":  "...",
+   "vault_role":      "terraform-workspace-name"}
 """
 
 import logging
@@ -11,36 +19,29 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from azure.core.exceptions import HttpResponseError
-from azure.identity import DefaultAzureCredential
+from azure.identity import ClientSecretCredential
 from azure.mgmt.compute import ComputeManagementClient
+
+from workers.vault import get_azure_credentials
 
 logger = logging.getLogger(__name__)
 
-# Conservative concurrency per subscription — stay well under the
-# ~0.33 RPS sustained limit by not hammering all at once.
-# At 8 concurrent with ~3s per op = ~2.6 RPS burst, then back off on 429.
 AZURE_CONCURRENCY_PER_SUB = 8
-
-# Cap on how long we'll honour a Retry-After before giving up and
-# letting Celery's own retry/backoff take over
-MAX_RETRY_AFTER_SECONDS = 120
+MAX_RETRY_AFTER_SECONDS   = 120
 
 
-def _compute_client(subscription_id: str) -> ComputeManagementClient:
-    credential = DefaultAzureCredential()
+def _compute_client(tenant_id: str, client_id: str,
+                    client_secret: str, subscription_id: str) -> ComputeManagementClient:
+    credential = ClientSecretCredential(
+        tenant_id=tenant_id,
+        client_id=client_id,
+        client_secret=client_secret,
+    )
     return ComputeManagementClient(credential, subscription_id)
 
 
-def _do_single_action(
-    client: ComputeManagementClient,
-    action: str,   # "on" or "off" — canonical strings from the collector
-    vm_id: str,
-    resource_group: str,
-) -> str:
-    """
-    Perform a single VM start or deallocate, with Retry-After handling.
-    Returns a detail string or raises on unrecoverable error.
-    """
+def _do_single_action(client: ComputeManagementClient, action: str,
+                      vm_id: str, resource_group: str) -> str:
     attempts = 0
     while True:
         try:
@@ -64,47 +65,52 @@ def _do_single_action(
                         "Azure 429 Retry-After=%ds exceeds cap for vm=%s — "
                         "deferring to Celery retry", retry_after, vm_id
                     )
-                    raise   # let Celery backoff handle it
+                    raise
                 logger.warning(
                     "Azure 429 for vm=%s — honouring Retry-After=%ds (attempt %d)",
                     vm_id, retry_after, attempts
                 )
                 time.sleep(retry_after)
-                continue  # retry the same VM
+                continue
             raise
 
 
-def azure_batch_action(
-    action: str,   # "on" or "off" — canonical strings from the collector
-    vms: list[dict],   # each: {vm_id, subscription_id, resource_group, ...}
-) -> dict[str, str]:
+def azure_batch_action(action: str, vms: list[dict]) -> dict[str, str]:
     """
-    Execute start or deallocate for a list of VMs sharing the same subscription.
-    Runs up to AZURE_CONCURRENCY_PER_SUB in parallel, honouring Retry-After.
-
+    Execute power_on or power_off for a list of VMs sharing the same
+    subscription_id. Fetches credentials from Vault per batch.
     Returns {vm_id: state_or_error}.
     """
     if not vms:
         return {}
 
-    subscription_id = vms[0]["subscription_id"]
+    config          = vms[0].get("provider_config") or {}
+    subscription_id = config.get("subscription_id", "")
+    vault_role      = config.get("vault_role", "")
+    tenant_id       = config.get("tenant_id", "")
+
     logger.info(
-        "Azure batch %s: subscription=%s count=%d",
-        action, subscription_id, len(vms)
+        "Azure batch power_%s: subscription=%s vault_role=%s count=%d",
+        action, subscription_id, vault_role, len(vms)
     )
 
-    # One client per subscription — DefaultAzureCredential is thread-safe
-    client = _compute_client(subscription_id)
+    # Fetch credentials from Vault Azure static secrets engine
+    tenant_id, client_id, client_secret = get_azure_credentials(
+        vault_role=vault_role,
+        tenant_id=tenant_id,
+    )
+
     results: dict[str, str] = {}
 
     with ThreadPoolExecutor(max_workers=AZURE_CONCURRENCY_PER_SUB) as pool:
         futures = {
             pool.submit(
                 _do_single_action,
-                client,
+                _compute_client(tenant_id, client_id,
+                                client_secret, subscription_id),
                 action,
                 vm["vm_id"],
-                vm["resource_group"],
+                (vm.get("provider_config") or {}).get("resource_group", ""),
             ): vm["vm_id"]
             for vm in vms
         }
@@ -114,9 +120,15 @@ def azure_batch_action(
             try:
                 state = future.result()
                 results[vm_id] = state
-                logger.info("Azure %s complete: vm=%s state=%s", action, vm_id, state)
+                logger.info(
+                    "Azure power_%s complete: vm=%s state=%s",
+                    action, vm_id, state
+                )
             except Exception as exc:
-                logger.error("Azure %s failed: vm=%s error=%s", action, vm_id, exc)
+                logger.error(
+                    "Azure power_%s failed: vm=%s error=%s",
+                    action, vm_id, exc
+                )
                 results[vm_id] = f"ERROR: {exc}"
 
     return results

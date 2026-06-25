@@ -1,33 +1,32 @@
 -- migrations/001_init.sql
--- Run once on a fresh database, or let SQLAlchemy's create_all handle it.
--- Kept here for reference, auditing, and manual DR recovery.
+-- Full schema for a fresh installation.
+-- SQLAlchemy's init_db() (create_all) handles this automatically on API startup.
+-- This file is kept as a reference for DR recovery and manual inspection.
 
 CREATE TABLE IF NOT EXISTS vm_schedules (
     vm_id               VARCHAR(255) PRIMARY KEY,
+    display_name        VARCHAR(255),                   -- from naming service
     provider            VARCHAR(32)  NOT NULL,
     timezone            VARCHAR(64)  NOT NULL DEFAULT 'Australia/Sydney',
 
-    power_off_hour      INTEGER      NOT NULL,
+    -- 24x7 sentinel: both hours = 0 means always-on, collector skips entirely
+    power_off_hour      INTEGER      NOT NULL DEFAULT 0,
     power_off_minute    INTEGER      NOT NULL DEFAULT 0,
-    power_on_hour       INTEGER      NOT NULL,
+    power_on_hour       INTEGER      NOT NULL DEFAULT 0,
     power_on_minute     INTEGER      NOT NULL DEFAULT 0,
-    -- blackouts: {"periods": ["weekends", "christmas-shutdown", "easter-break", ...]}
-    -- "weekends" is a built-in period. Empty array = no blackouts.
-    -- Both power hours = 0 is the 24x7 sentinel (no operations scheduled).
-    blackouts           JSONB        NOT NULL DEFAULT '{"periods": ["weekends", "christmas-shutdown", "easter-break"]}',
 
-    -- AWS
-    region              VARCHAR(64),
-    role_arn            VARCHAR(255),
+    -- Blackout periods: {"periods": ["weekends", "christmas-shutdown", ...]}
+    -- "weekends" is built-in; others are named calendar lookups in Redis.
+    blackouts           JSONB        NOT NULL DEFAULT '{"periods": ["weekends"]}',
 
-    -- Azure
-    subscription_id     VARCHAR(64),
-    resource_group      VARCHAR(128),
+    -- All provider-specific fields in one flexible column:
+    --   AWS:    {"role_arn": "...", "region": "ap-southeast-2"}
+    --   Azure:  {"tenant_id": "...", "subscription_id": "...",
+    --            "resource_group": "...", "vault_role": "workspace-name"}
+    --   VMware: {"vcenter_host": "vcenter.internal.example.com"}
+    provider_config     JSONB        NOT NULL DEFAULT '{}',
 
-    -- VMware
-    vcenter_host        VARCHAR(255),
-
-    -- Audit columns — updated by batch collector after each run
+    -- Audit columns — updated by batch collector after each execution
     last_power_off_at       TIMESTAMPTZ,
     last_power_on_at        TIMESTAMPTZ,
     last_power_off_result   VARCHAR(64),
@@ -37,23 +36,23 @@ CREATE TABLE IF NOT EXISTS vm_schedules (
     updated_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
--- Collector query: fetch all rows — no WHERE clause needed at 5k rows.
--- Index retained for future Option B timezone-pushdown queries if fleet grows.
+-- GIN index for provider_config lookups (subscription_id, role_arn etc.)
 CREATE INDEX IF NOT EXISTS idx_vm_schedules_provider
     ON vm_schedules (provider);
 
-CREATE INDEX IF NOT EXISTS idx_vm_schedules_timezone_hours
-    ON vm_schedules (timezone, power_on_hour, power_on_minute, power_off_hour, power_off_minute);
+CREATE INDEX IF NOT EXISTS idx_vm_schedules_provider_config
+    ON vm_schedules USING gin (provider_config);
 
 
 CREATE TABLE IF NOT EXISTS execution_log (
-    id          BIGSERIAL    PRIMARY KEY,
-    vm_id       VARCHAR(255) NOT NULL,
-    provider    VARCHAR(32)  NOT NULL,
-    action      VARCHAR(16)  NOT NULL,   -- 'on' or 'off'
-    result      VARCHAR(64)  NOT NULL,   -- 'success', 'suppressed', 'error'
-    detail      TEXT,                    -- error message or suppression reason
-    executed_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+    id           BIGSERIAL    PRIMARY KEY,
+    vm_id        VARCHAR(255) NOT NULL,
+    display_name VARCHAR(255),
+    provider     VARCHAR(32)  NOT NULL,
+    action       VARCHAR(16)  NOT NULL,   -- 'on' or 'off'
+    result       VARCHAR(64)  NOT NULL,   -- 'success', 'suppressed', 'error', 'expired'
+    detail       TEXT,
+    executed_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_execution_log_vm_id
@@ -62,9 +61,9 @@ CREATE INDEX IF NOT EXISTS idx_execution_log_vm_id
 CREATE INDEX IF NOT EXISTS idx_execution_log_executed_at
     ON execution_log (executed_at DESC);
 
--- Useful view: latest result per VM
+-- Convenience view: latest result per VM per action
 CREATE OR REPLACE VIEW vm_last_executions AS
 SELECT DISTINCT ON (vm_id, action)
-    vm_id, provider, action, result, detail, executed_at
+    vm_id, display_name, provider, action, result, detail, executed_at
 FROM execution_log
 ORDER BY vm_id, action, executed_at DESC;

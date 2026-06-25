@@ -7,29 +7,17 @@ terraform {
   }
 }
 
+# ---------------------------------------------------------------------------
+# Variables — user-facing (intent only)
+# ---------------------------------------------------------------------------
+
 variable "scheduler_api_url" {
   description = "Base URL of the vm-scheduler API (internal cluster DNS)"
   type        = string
 }
 
-variable "vm_id" {
-  description = "AWS EC2 instance ID"
-  type        = string
-}
-
-variable "region" {
-  description = "AWS region the instance lives in (retained for future multi-region support)"
-  type        = string
-}
-
-variable "role_arn" {
-  description = "IAM role ARN the scheduler will assume to operate on this instance. Encodes the account implicitly and scopes batch grouping — each role should be limited to the instances of its own workload/workspace."
-  type        = string
-  # e.g. "arn:aws:iam::123456789012:role/vm-scheduler-role"
-}
-
 variable "power_off_hour" {
-  description = "Hour to power off (0-23, in the specified timezone). Default 0 + power_on_hour default 0 = 24x7 (no scheduling)."
+  description = "Hour to power off (0-23). Default 0 + power_on_hour 0 = 24x7."
   type        = number
   default     = 0
 }
@@ -41,7 +29,7 @@ variable "power_off_minute" {
 }
 
 variable "power_on_hour" {
-  description = "Hour to power on (0-23, in the specified timezone). Default 0 + power_off_hour default 0 = 24x7 (no scheduling)."
+  description = "Hour to power on (0-23). Default 0 + power_off_hour 0 = 24x7."
   type        = number
   default     = 0
 }
@@ -59,10 +47,37 @@ variable "timezone" {
 }
 
 variable "blackout_periods" {
-  description = "Named blackout periods this VM observes. 'weekends' is a built-in period; others are looked up in the central calendar store. Empty list = no blackouts."
+  description = "Named blackout periods. 'weekends' is built-in; others are calendar names."
   type        = list(string)
-  default     = ["weekends", "christmas-shutdown", "nat-public-holidays"]
+  default     = ["weekends"]
 }
+
+# ---------------------------------------------------------------------------
+# Resolved by the module from Terraform state / Vault — not user-facing
+# ---------------------------------------------------------------------------
+
+variable "vm_id" {
+  description = "EC2 instance ID — resolved from terraform state"
+  type        = string
+}
+
+variable "display_name" {
+  description = "Human-readable VM name from the naming service"
+  type        = string
+  # source: module.naming-service.generated_vm_name
+}
+
+variable "role_arn" {
+  description = "IAM role ARN — resolved from Vault by the module"
+  type        = string
+}
+
+variable "region" {
+  description = "AWS region — resolved from provider config"
+  type        = string
+}
+
+# ---------------------------------------------------------------------------
 
 provider "restapi" {
   uri                  = var.scheduler_api_url
@@ -76,16 +91,22 @@ resource "restapi_object" "vm_schedule" {
   id_attribute = "vm_id"
 
   data = jsonencode({
-    vm_id            = var.vm_id
-    provider         = "aws"
-    region           = var.region
-    role_arn         = var.role_arn
+    vm_id        = var.vm_id
+    display_name = var.display_name
+    provider     = "aws"
+    timezone     = var.timezone
+
     power_off_hour   = var.power_off_hour
     power_off_minute = var.power_off_minute
     power_on_hour    = var.power_on_hour
     power_on_minute  = var.power_on_minute
-    timezone         = var.timezone
+
     blackout_periods = var.blackout_periods
+
+    provider_config = {
+      role_arn = var.role_arn
+      region   = var.region
+    }
   })
 }
 
@@ -94,5 +115,5 @@ output "vm_id" {
 }
 
 output "schedule_summary" {
-  value = var.power_on_hour == 0 && var.power_off_hour == 0 ? "24x7 (no scheduling)" : "off=${var.power_off_hour}:${format("%02d", var.power_off_minute)} on=${var.power_on_hour}:${format("%02d", var.power_on_minute)} tz=${var.timezone}"
+  value = var.power_on_hour == 0 && var.power_off_hour == 0 ? "24x7" : "off=${var.power_off_hour}:${format("%02d", var.power_off_minute)} on=${var.power_on_hour}:${format("%02d", var.power_on_minute)} tz=${var.timezone}"
 }

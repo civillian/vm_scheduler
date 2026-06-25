@@ -1,8 +1,18 @@
 """
 db.py — SQLAlchemy models and session management.
 
-vm_schedules  — one row per registered VM (replaces Redis vm_meta:* keys)
-execution_log — audit trail of every power action attempted
+vm_schedules  — one row per registered VM
+execution_log — append-only audit trail of every power action attempted
+
+provider_config is a JSONB column storing all provider-specific fields:
+
+  AWS:    {"role_arn": "...", "region": "ap-southeast-2"}
+  Azure:  {"tenant_id": "...", "subscription_id": "...",
+           "resource_group": "...", "vault_role": "workspace-name"}
+  VMware: {"vcenter_host": "vcenter.internal.example.com"}
+
+This keeps the schema provider-agnostic and allows new fields to be
+added without schema migrations.
 """
 
 from __future__ import annotations
@@ -25,7 +35,7 @@ engine = create_engine(
     DATABASE_URL,
     pool_size=5,
     max_overflow=10,
-    pool_pre_ping=True,   # cheap liveness check before each checkout
+    pool_pre_ping=True,
 )
 
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
@@ -43,37 +53,31 @@ class VmSchedule(Base):
     __tablename__ = "vm_schedules"
 
     vm_id            = Column(String(255), primary_key=True)
+    display_name     = Column(String(255), nullable=True)   # from naming service
     provider         = Column(String(32),  nullable=False)
     timezone         = Column(String(64),  nullable=False, default="Australia/Sydney")
 
-    power_off_hour   = Column(Integer, nullable=False)
+    power_off_hour   = Column(Integer, nullable=False, default=0)
     power_off_minute = Column(Integer, nullable=False, default=0)
-    power_on_hour    = Column(Integer, nullable=False)
+    power_on_hour    = Column(Integer, nullable=False, default=0)
     power_on_minute  = Column(Integer, nullable=False, default=0)
+
     # Blackout periods: {"periods": ["weekends", "christmas-shutdown", ...]}
-    # "weekends" is built-in; all others are named calendar lookups.
-    # Empty list = no blackouts. Both hours = 0 means 24x7 mode.
     blackouts        = Column(JSON, nullable=False, default=dict)
 
-    # AWS
-    region           = Column(String(64))
-    role_arn         = Column(String(255))
+    # All provider-specific fields — see module docstring for shapes per provider
+    provider_config  = Column(JSON, nullable=False, default=dict)
 
-    # Azure
-    subscription_id  = Column(String(64))
-    resource_group   = Column(String(128))
-
-    # VMware
-    vcenter_host     = Column(String(255))
-
-    # Audit — updated by the batch collector after each execution
+    # Audit — updated by batch collector after each execution
     last_power_off_at     = Column(DateTime(timezone=True))
     last_power_on_at      = Column(DateTime(timezone=True))
-    last_power_off_result = Column(String(64))   # e.g. "success", "suppressed", "error"
+    last_power_off_result = Column(String(64))
     last_power_on_result  = Column(String(64))
 
-    created_at       = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
-    updated_at       = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc),
+    created_at       = Column(DateTime(timezone=True),
+                              default=lambda: datetime.now(timezone.utc))
+    updated_at       = Column(DateTime(timezone=True),
+                              default=lambda: datetime.now(timezone.utc),
                               onupdate=lambda: datetime.now(timezone.utc))
 
     def to_dict(self) -> dict:
@@ -81,18 +85,16 @@ class VmSchedule(Base):
 
 
 class ExecutionLog(Base):
-    """
-    Append-only record of every power action attempted.
-    Provides the audit trail deferred from the original POC design.
-    """
+    """Append-only record of every power action attempted."""
     __tablename__ = "execution_log"
 
     id          = Column(Integer, primary_key=True, autoincrement=True)
     vm_id       = Column(String(255), nullable=False, index=True)
+    display_name = Column(String(255), nullable=True)
     provider    = Column(String(32),  nullable=False)
     action      = Column(String(16),  nullable=False)   # "on" or "off"
-    result      = Column(String(64),  nullable=False)   # "success", "suppressed", "error"
-    detail      = Column(Text)                          # error message or suppression reason
+    result      = Column(String(64),  nullable=False)   # "success", "suppressed", "error", "expired"
+    detail      = Column(Text)
     executed_at = Column(DateTime(timezone=True),
                          default=lambda: datetime.now(timezone.utc),
                          nullable=False, index=True)
@@ -108,7 +110,6 @@ def init_db():
 
 
 def healthcheck() -> bool:
-    """Verify database connectivity. Used by /healthz."""
     try:
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))

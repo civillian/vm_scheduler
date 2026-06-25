@@ -1,10 +1,15 @@
 """
 batch_collector.py — groups VMs due for a power action and dispatches
-one API call per account/subscription rather than one per VM.
+one API call per provider group rather than one per VM.
 
 Schedule metadata is read from Postgres (vm_schedules table).
 Redis is used only as the Celery broker and redbeat schedule store.
 Execution results are written back to Postgres (execution_log table).
+
+Grouping keys:
+  AWS:    (provider, role_arn, region)      — one STS assume-role per group
+  Azure:  (provider, subscription_id)       — rate limit is per subscription
+  VMware: (provider, vcenter_host)          — one vCenter connection per group
 """
 
 from __future__ import annotations
@@ -17,20 +22,14 @@ from zoneinfo import ZoneInfo
 from db import ExecutionLog, VmSchedule, get_session
 from workers.celery_app import celery_app
 from workers.blackouts import is_blackout
+from workers.vault import VaultConfigError
 
 logger = logging.getLogger(__name__)
 
-# How long a dispatched batch task is allowed to sit in the queue before
-# Celery discards it unexecuted. If all workers are down for longer than
-# this, a missed power on/off simply doesn't happen for that cycle —
-# the VM stays in its current state until the next scheduled cycle.
-# This avoids a backlog of stale power operations firing late on recovery.
-TASK_EXPIRY_SECONDS = 300   # 5 minutes
-
-# The collector tick itself also expires quickly — if Beat queues several
-# ticks while workers are down, stale ticks are dropped rather than all
-# firing back-to-back on recovery and re-evaluating against a stale "now".
-COLLECTOR_EXPIRY_SECONDS = 60
+# Task expiry — if workers are down, stale tasks are dropped rather than
+# firing late on recovery. A missed cycle simply doesn't happen.
+TASK_EXPIRY_SECONDS     = 300   # 5 minutes for batch power tasks
+COLLECTOR_EXPIRY_SECONDS = 60   # 1 minute for the collector tick itself
 
 
 # ---------------------------------------------------------------------------
@@ -38,32 +37,28 @@ COLLECTOR_EXPIRY_SECONDS = 60
 # ---------------------------------------------------------------------------
 
 def _all_vm_schedules() -> list[dict]:
-    """
-    Fetch all VM schedules from Postgres as plain dicts.
-    Single SELECT, no filtering — at 5,000 rows this is <5ms.
-    Option B (timezone-pushdown WHERE clause) available if fleet grows to 50k+.
-    """
+    """Fetch all VM schedules as plain dicts. Single SELECT, no filtering."""
     with get_session() as session:
         rows = session.query(VmSchedule).all()
         return [row.to_dict() for row in rows]
 
 
-def _is_24x7(meta: dict) -> bool:
-    """24x7 sentinel — both hours are 0, VM should never be power-cycled."""
-    return meta.get("power_on_hour", 0) == 0 and meta.get("power_off_hour", 0) == 0
-
-
 def _local_now(meta: dict, now_utc: datetime) -> datetime:
     """
-    Convert "now" (UTC) into the VM's own timezone.
-
-    Used for both the due-time check and the blackout date check, so the
-    two never disagree about what day or hour it currently is for this VM
-    — regardless of the container's own local timezone (which may be UTC,
-    or Australia/Sydney, depending on deployment).
+    Convert UTC now to the VM's local timezone. Used for both due-time
+    and blackout checks so both always agree on the current local date/time,
+    regardless of the container's own timezone setting.
     """
     tz = ZoneInfo(meta.get("timezone") or "UTC")
     return now_utc.astimezone(tz)
+
+
+def _is_24x7(meta: dict) -> bool:
+    """24x7 sentinel — both hours are 0, VM should never be power-cycled."""
+    return (
+        meta.get("power_on_hour",  0) == 0 and
+        meta.get("power_off_hour", 0) == 0
+    )
 
 
 def _is_due(meta: dict, action: str, now_local: datetime) -> bool:
@@ -75,7 +70,7 @@ def _is_due(meta: dict, action: str, now_local: datetime) -> bool:
     if _is_24x7(meta):
         return False
 
-    scheduled_hour   = meta.get(f"power_{action}_hour", 0)
+    scheduled_hour   = meta.get(f"power_{action}_hour",   0)
     scheduled_minute = meta.get(f"power_{action}_minute", 0)
 
     return (
@@ -86,36 +81,35 @@ def _is_due(meta: dict, action: str, now_local: datetime) -> bool:
 
 def _group_key(meta: dict) -> tuple:
     """
-    Determines which VMs can be dispatched together in a single batch.
-
-    AWS:   grouped by (role_arn, region). Each role is scoped to a single
-           workload/workspace, so this naturally limits batch blast radius
-           to the instances that role actually has permission over.
-    Azure: grouped by subscription_id — rate limiting is per-subscription.
-    VMware: grouped by vcenter_host — no batch API, but groups concurrent
-           dispatch by target vCenter.
+    Determines which VMs can be batched together in a single API call.
+    All fields come from provider_config JSONB column.
     """
     provider = meta["provider"]
+    config   = meta.get("provider_config") or {}
+
     if provider == "aws":
-        return (provider, meta.get("role_arn", ""), meta.get("region", ""))
+        return (provider, config.get("role_arn", ""), config.get("region", ""))
     if provider == "azure":
-        return (provider, meta.get("subscription_id", ""))
-    return (provider, meta.get("vcenter_host", ""))
+        return (provider, config.get("subscription_id", ""))
+    return (provider, config.get("vcenter_host", ""))
 
 
-def _write_log(vm_id: str, provider: str, action: str, result: str, detail: str | None = None):
+def _write_log(vm_id: str, display_name: str | None, provider: str,
+               action: str, result: str, detail: str | None = None):
     """
-    Append one row to execution_log and update the summary columns on vm_schedules.
-    Called by each batch task after execution.
+    Append one row to execution_log and update summary columns on vm_schedules.
     """
     now = datetime.now(timezone.utc)
     with get_session() as session:
         session.add(ExecutionLog(
-            vm_id=vm_id, provider=provider,
-            action=action, result=result,
-            detail=detail, executed_at=now,
+            vm_id=vm_id,
+            display_name=display_name,
+            provider=provider,
+            action=action,
+            result=result,
+            detail=detail,
+            executed_at=now,
         ))
-
         row = session.get(VmSchedule, vm_id)
         if row:
             if action == "off":
@@ -124,7 +118,6 @@ def _write_log(vm_id: str, provider: str, action: str, result: str, detail: str 
             else:
                 row.last_power_on_at     = now
                 row.last_power_on_result = result
-
         session.commit()
 
 
@@ -132,7 +125,10 @@ def _write_log(vm_id: str, provider: str, action: str, result: str, detail: str 
 # Collector task — fires every minute via redbeat
 # ---------------------------------------------------------------------------
 
-@celery_app.task(name="workers.batch_collector.collect_and_dispatch")
+@celery_app.task(
+    name="workers.batch_collector.collect_and_dispatch",
+    expires=COLLECTOR_EXPIRY_SECONDS,
+)
 def collect_and_dispatch():
     now_utc = datetime.now(tz=ZoneInfo("UTC"))
     logger.info("Batch collector running at %s UTC", now_utc.strftime("%H:%M"))
@@ -147,13 +143,18 @@ def collect_and_dispatch():
             now_local = _local_now(meta, now_utc)
             if not _is_due(meta, action, now_local):
                 continue
-            # Pass the VM-local date explicitly — is_blackout() must not
-            # compute its own "today", since the container's local timezone
-            # may not match the VM's schedule timezone (see _local_now).
+            # Pass VM-local date explicitly — is_blackout() must not
+            # compute its own "today" since the container timezone may differ
             blocked, reason = is_blackout(meta["vm_id"], today=now_local.date())
             if blocked:
-                logger.info("Suppressed power_%s vm=%s reason=%s", action, meta["vm_id"], reason)
-                _write_log(meta["vm_id"], meta["provider"], action, "suppressed", reason)
+                logger.info(
+                    "Suppressed power_%s vm=%s reason=%s",
+                    action, meta["vm_id"], reason
+                )
+                _write_log(
+                    meta["vm_id"], meta.get("display_name"),
+                    meta["provider"], action, "suppressed", reason
+                )
                 continue
             due_vms.append(meta)
 
@@ -202,16 +203,23 @@ def collect_and_dispatch():
 def aws_batch_power(self, action: str, vms: list[dict]):
     from workers.providers.aws import aws_batch_action
 
-    results = aws_batch_action(action, vms)
+    # VaultConfigError is a configuration problem — retrying won't fix it.
+    # Fail immediately rather than burning through max_retries.
+    try:
+        results = aws_batch_action(action, vms)
+    except VaultConfigError:
+        raise   # bypass autoretry — goes straight to task_failure signal
 
     failed = {}
     for vm_id, state in results.items():
-        provider = next(v["provider"] for v in vms if v["vm_id"] == vm_id)
+        meta = next((v for v in vms if v["vm_id"] == vm_id), {})
         if state.startswith("ERROR:"):
             failed[vm_id] = state
-            _write_log(vm_id, provider, action, "error", state)
+            _write_log(vm_id, meta.get("display_name"),
+                       meta.get("provider", "aws"), action, "error", state)
         else:
-            _write_log(vm_id, provider, action, "success", state)
+            _write_log(vm_id, meta.get("display_name"),
+                       meta.get("provider", "aws"), action, "success", state)
 
     if failed:
         logger.error("AWS batch had %d failures: %s", len(failed), failed)
@@ -236,16 +244,21 @@ def aws_batch_power(self, action: str, vms: list[dict]):
 def azure_batch_power(self, action: str, vms: list[dict]):
     from workers.providers.azure import azure_batch_action
 
-    results = azure_batch_action(action, vms)
+    try:
+        results = azure_batch_action(action, vms)
+    except VaultConfigError:
+        raise   # bypass autoretry — goes straight to task_failure signal
 
     failed = {}
     for vm_id, state in results.items():
-        provider = next(v["provider"] for v in vms if v["vm_id"] == vm_id)
+        meta = next((v for v in vms if v["vm_id"] == vm_id), {})
         if state.startswith("ERROR:"):
             failed[vm_id] = state
-            _write_log(vm_id, provider, action, "error", state)
+            _write_log(vm_id, meta.get("display_name"),
+                       meta.get("provider", "azure"), action, "error", state)
         else:
-            _write_log(vm_id, provider, action, "success", state)
+            _write_log(vm_id, meta.get("display_name"),
+                       meta.get("provider", "azure"), action, "success", state)
 
     if failed:
         logger.error("Azure batch had %d failures: %s", len(failed), failed)
@@ -271,56 +284,53 @@ def vmware_single_power(self, action: str, vm: dict):
     from workers.providers.vmware import vmware_power_off, vmware_power_on
     from workers.lock import vm_lock, VmLockError
 
-    vm_id = vm["vm_id"]
+    vm_id        = vm["vm_id"]
+    display_name = vm.get("display_name")
+    provider_cfg = vm.get("provider_config") or {}
+
     try:
         with vm_lock(vm_id, action=f"power_{action}"):
             if action == "off":
-                vmware_power_off(**vm)
+                vmware_power_off(vm_id=vm_id, provider_config=provider_cfg)
             else:
-                vmware_power_on(**vm)
-        _write_log(vm_id, vm["provider"], action, "success")
+                vmware_power_on(vm_id=vm_id, provider_config=provider_cfg)
+        _write_log(vm_id, display_name, vm.get("provider", "vmware"),
+                   action, "success")
+    except VaultConfigError:
+        raise   # bypass autoretry — goes straight to task_failure signal
     except VmLockError:
-        logger.warning("VMware power_%s skipped — lock held for vm=%s", action, vm_id)
-        _write_log(vm_id, vm["provider"], action, "suppressed", "lock held")
+        logger.warning(
+            "VMware power_%s skipped — lock held for vm=%s", action, vm_id
+        )
+        _write_log(vm_id, display_name, vm.get("provider", "vmware"),
+                   action, "suppressed", "lock held")
     except Exception as exc:
-        _write_log(vm_id, vm["provider"], action, "error", str(exc))
+        _write_log(vm_id, display_name, vm.get("provider", "vmware"),
+                   action, "error", str(exc))
         raise
 
 
 # ---------------------------------------------------------------------------
-# Failure handling — connection/credential-level errors
+# Failure / expiry signal handlers
 # ---------------------------------------------------------------------------
-#
-# _write_log() inside each batch task only runs for per-VM ERROR results
-# returned by aws_batch_action/azure_batch_action — i.e. failures that
-# happen *after* a connection was established (e.g. an individual
-# instance ID not found).
-#
-# Connection or credential-level failures (bad role_arn, expired creds,
-# network unreachable, NoCredentialsError, etc.) raise *before* any
-# results dict is returned. These propagate through autoretry_for and,
-# once max_retries is exhausted, the task simply fails — with nothing
-# written to execution_log unless we catch it here.
-#
-# task_failure fires once, after retries are exhausted, for every task
-# that ends in permanent failure. This is the backstop that ensures
-# every VM in the batch gets an "error" row regardless of which layer
-# the failure occurred in.
 
-from celery.signals import task_failure
+from celery.signals import task_failure, task_revoked
 
 
 @task_failure.connect
-def _on_task_failure(sender=None, task_id=None, exception=None, args=None, **kwargs):
+def _on_task_failure(sender=None, task_id=None, exception=None,
+                     args=None, **kwargs):
+    """
+    Catch permanent failures (after all retries exhausted) for connection/
+    credential-level errors that bypass per-VM _write_log calls.
+    """
     task_name = getattr(sender, "name", "") or ""
     if "batch_collector" not in task_name:
         return
     if task_name.endswith("collect_and_dispatch"):
-        return  # no per-VM args to extract
+        return
 
-    # Partial batch failures (aws_batch_power / azure_batch_power) already
-    # call _write_log per-VM with specific error details before raising
-    # this RuntimeError — don't double-log with a generic message.
+    # Partial batch failures already logged per-VM — don't double-log
     if isinstance(exception, RuntimeError) and "Partial batch failure" in str(exception):
         return
 
@@ -329,8 +339,7 @@ def _on_task_failure(sender=None, task_id=None, exception=None, args=None, **kwa
 
     action, vms = args
     if task_name.endswith("vmware_single_power"):
-        vms = [vms]   # single VM dict, not a list
-
+        vms = [vms]
     if not isinstance(vms, list):
         return
 
@@ -343,33 +352,21 @@ def _on_task_failure(sender=None, task_id=None, exception=None, args=None, **kwa
                 vm.get("vm_id"), action, task_name, exception
             )
             _write_log(
-                vm.get("vm_id"), vm.get("provider", "unknown"),
-                action, "error", detail
+                vm.get("vm_id"), vm.get("display_name"),
+                vm.get("provider", "unknown"), action, "error", detail
             )
         except Exception:
-            logger.exception("Failed to write failure log for vm=%s", vm.get("vm_id"))
-
-
-# ---------------------------------------------------------------------------
-# Expiry handling
-# ---------------------------------------------------------------------------
-
-from celery.signals import task_revoked
+            logger.exception(
+                "Failed to write failure log for vm=%s", vm.get("vm_id")
+            )
 
 
 @task_revoked.connect
-def _on_task_revoked(request=None, terminated=None, signum=None, expired=None, **kwargs):
-    """
-    Fired when a task is discarded due to expiry (or manual revocation).
-    Writes an "expired" execution_log entry per affected VM so missed
-    operations are visible in /schedules/summary rather than vanishing
-    silently from the queue.
-
-    Only batch power tasks carry VM-level detail worth logging — the
-    collector tick itself (collect_and_dispatch) has no args to extract.
-    """
+def _on_task_revoked(request=None, terminated=None,
+                     signum=None, expired=None, **kwargs):
+    """Write 'expired' log entries when tasks are dropped due to expiry."""
     if not expired:
-        return  # manual revocation, not an expiry — nothing to log
+        return
 
     task_name = getattr(request, "task", "") or ""
     if "batch_collector" not in task_name:
@@ -381,21 +378,22 @@ def _on_task_revoked(request=None, terminated=None, signum=None, expired=None, *
 
     action, vms = args
     if task_name.endswith("vmware_single_power"):
-        vms = [vms]   # single VM dict, not a list
-
+        vms = [vms]
     if not isinstance(vms, list):
         return
 
     for vm in vms:
         try:
             logger.warning(
-                "Task expired before execution: vm=%s action=power_%s task=%s",
-                vm.get("vm_id"), action, task_name
+                "Task expired before execution: vm=%s action=power_%s",
+                vm.get("vm_id"), action
             )
             _write_log(
-                vm.get("vm_id"), vm.get("provider", "unknown"),
-                action, "expired",
+                vm.get("vm_id"), vm.get("display_name"),
+                vm.get("provider", "unknown"), action, "expired",
                 "Task expired in queue — all workers were unavailable"
             )
         except Exception:
-            logger.exception("Failed to write expiry log for vm=%s", vm.get("vm_id"))
+            logger.exception(
+                "Failed to write expiry log for vm=%s", vm.get("vm_id")
+            )

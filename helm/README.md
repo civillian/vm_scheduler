@@ -10,8 +10,8 @@ Deploys the VM power scheduler stack to Kubernetes (AKS) or OpenShift.
 | `worker` | Celery workers — execute batch power operations |
 | `beat` | Celery Beat — fires the every-minute collector tick via redbeat |
 | `flower` | Task dashboard — optional, enabled by default |
-| `postgresql` | Bundled Postgres subchart (devtest only) |
-| `redis` | Bundled Redis subchart (devtest only) |
+| `postgresql` | Bundled Postgres subchart |
+| `redis` | Bundled Redis subchart |
 
 ## Prerequisites
 
@@ -67,7 +67,7 @@ redbeat lock has a 10-minute TTL, so tick delivery resumes within
 
 ## Vault token management
 
-For production, avoid passing `vault.token` as a Helm value (it ends up
+Avoid passing `vault.token` as a Helm value (it ends up
 in Kubernetes Secret in plaintext). Preferred alternatives:
 
 - **Vault Agent Injector** — sidecar injects the token via annotations
