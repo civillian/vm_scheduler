@@ -34,12 +34,13 @@ services:
     build: .
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
     ports:
-      # Bind to LAN-facing IP only — avoids Docker's default 0.0.0.0 binding
-      # which can expose the service on internet-facing interfaces.
-      # Change to your host's LAN IP, or use an SSH tunnel instead.
-      - "192.168.100.1:8000:8000"
+      - "8000:8000"
     environment:
-      - DATABASE_URL=postgresql://scheduler:scheduler@postgres:5432/scheduler
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=scheduler
+      - DB_PASSWORD=scheduler
+      - DB_NAME=scheduler
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - REDIS_BROKER_DB=0
@@ -56,7 +57,7 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -66,7 +67,11 @@ services:
     build: .
     command: celery -A workers.celery_app worker --loglevel=info --concurrency=4 -E
     environment:
-      - DATABASE_URL=postgresql://scheduler:scheduler@postgres:5432/scheduler
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=scheduler
+      - DB_PASSWORD=scheduler
+      - DB_NAME=scheduler
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - REDIS_BROKER_DB=0
@@ -89,7 +94,11 @@ services:
     build: .
     command: celery -A workers.celery_app beat --scheduler redbeat.RedBeatScheduler --loglevel=info
     environment:
-      - DATABASE_URL=postgresql://scheduler:scheduler@postgres:5432/scheduler
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=scheduler
+      - DB_PASSWORD=scheduler
+      - DB_NAME=scheduler
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - REDIS_BROKER_DB=0
@@ -108,9 +117,13 @@ services:
     build: .
     command: celery -A workers.celery_app flower --port=5555
     ports:
-      - "192.168.100.1:5555:5555"
+      - "5555:5555"
     environment:
-      - DATABASE_URL=postgresql://scheduler:scheduler@postgres:5432/scheduler
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=scheduler
+      - DB_PASSWORD=scheduler
+      - DB_NAME=scheduler
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - REDIS_BROKER_DB=0

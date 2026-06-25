@@ -48,13 +48,13 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
-Database URL — bundled Postgres or external
+Database host — bundled Postgres or external
 */}}
-{{- define "vm-scheduler.databaseUrl" -}}
+{{- define "vm-scheduler.dbHost" -}}
 {{- if .Values.postgresql.enabled }}
-{{- printf "postgresql://%s:%s@%s-postgresql:5432/%s" .Values.postgresql.auth.username .Values.postgresql.auth.password (include "vm-scheduler.fullname" .) .Values.postgresql.auth.database }}
+{{- printf "%s-postgresql" (include "vm-scheduler.fullname" .) }}
 {{- else }}
-{{- printf "postgresql://%s:%s@%s:%d/%s" .Values.externalDatabase.username .Values.externalDatabase.password .Values.externalDatabase.host (.Values.externalDatabase.port | int) .Values.externalDatabase.database }}
+{{- .Values.externalDatabase.host }}
 {{- end }}
 {{- end }}
 
@@ -76,11 +76,19 @@ a full URL, so that shared Redis instances can use specific databases without
 embedding passwords in values files.
 */}}
 {{- define "vm-scheduler.commonEnv" -}}
-- name: DATABASE_URL
+- name: DB_HOST
+  value: {{ include "vm-scheduler.dbHost" . | quote }}
+- name: DB_PORT
+  value: {{ if .Values.postgresql.enabled }}"5432"{{ else }}{{ .Values.externalDatabase.port | default 5432 | quote }}{{ end }}
+- name: DB_USER
+  value: {{ if .Values.postgresql.enabled }}{{ .Values.postgresql.auth.username | quote }}{{ else }}{{ .Values.externalDatabase.username | quote }}{{ end }}
+- name: DB_PASSWORD
   valueFrom:
     secretKeyRef:
       name: {{ include "vm-scheduler.fullname" . }}-db
-      key: url
+      key: password
+- name: DB_NAME
+  value: {{ if .Values.postgresql.enabled }}{{ .Values.postgresql.auth.database | quote }}{{ else }}{{ .Values.externalDatabase.database | quote }}{{ end }}
 - name: REDIS_HOST
   value: {{ .Values.externalRedis.host | default (printf "%s-redis-master" (include "vm-scheduler.fullname" .)) | quote }}
 - name: REDIS_PORT

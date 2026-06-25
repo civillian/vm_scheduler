@@ -26,13 +26,17 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL",
-    "postgresql://scheduler:scheduler@postgres:5432/scheduler"
-)
+from sqlalchemy.engine import URL as _URL
 
 engine = create_engine(
-    DATABASE_URL,
+    _URL.create(
+        drivername="postgresql",
+        username=os.environ.get("DB_USER",     "scheduler"),
+        password=os.environ.get("DB_PASSWORD", "scheduler"),
+        host=    os.environ.get("DB_HOST",     "postgres"),
+        port=int(os.environ.get("DB_PORT",     "5432")),
+        database=os.environ.get("DB_NAME",     "scheduler"),
+    ),
     pool_size=5,
     max_overflow=10,
     pool_pre_ping=True,

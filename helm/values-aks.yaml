@@ -5,6 +5,8 @@
 #   -f helm/values-aks.yaml \
 #   --set vault.addr=https://vault.example.com \
 #   --set vault.token=xxx \
+#   --set externalDatabase.password=xxx \
+#   --set externalRedis.password=xxx \
 #   -n vm-scheduler --create-namespace
 
 image:
@@ -13,9 +15,24 @@ image:
 imagePullSecrets:
   - name: artifactory-pull
 
-# Bundled Postgres and Redis (values.yaml defaults)
-# postgresql.enabled: true  (default)
-# redis.enabled: true       (default)
+postgresql:
+  enabled: false
+
+externalDatabase:
+  host:     "TODO"       # fill in from <clustername>-pguser-vm-scheduler secret after PGO reconciles
+  username: "vm-scheduler"
+  database: "vm-scheduler"
+  # password: --set externalDatabase.password=xxx
+
+redis:
+  enabled: false
+
+externalRedis:
+  host:     "redis-master.redis.svc.cluster.local"
+  port:     6379
+  brokerDb: 2
+  resultDb: 3
+  # password: --set externalRedis.password=xxx
 
 # Vault — addr is env-specific; paths and azureMount come from values.yaml
 vault:
